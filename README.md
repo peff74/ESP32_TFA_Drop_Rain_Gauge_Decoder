@@ -5,7 +5,9 @@
  - Works with ESP32 and similar boards
  - Uses RX470-4 receiver module (less than $2 on Ali)
 
-![TFA Rain Gauge](https://via.placeholder.com/400x200/0066cc/ffffff?text=TFA+30.3233.01+Rain+Gauge)
+![TFA Rain Gauge logo](https://github.com/peff74/ESP32_TFA_Drop_Rain_Gauge_Decoder/blob/main/TFA_Regenmesser.jpeg)
+![TFA Rain Gauge logo](https://github.com/peff74/ESP32_TFA_Drop_Rain_Gauge_Decoder/blob/main/RF433.jpg)
+
 
 ## Arduino script features
  - Real-time 433MHz RF signal decoding
