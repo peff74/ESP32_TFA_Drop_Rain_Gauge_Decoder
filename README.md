@@ -241,3 +241,6 @@ RX470-4 DATA ──┬─── 1  kΩ ───┬─── ESP32 GPIO 22
  - Add filter circuit between receiver and ESP32
  - Move away from RF interference sources
  - Check receiver module quality
+
+![Badge](https://hitscounter.dev/api/hit?url=https%3A%2F%2Fgithub.com%2Fpeff74%2FESP32_TFA_Drop_Rain_Gauge_Decoder&label=Hits&icon=github&color=%23198754&message=&style=flat&tz=UTC)
+
