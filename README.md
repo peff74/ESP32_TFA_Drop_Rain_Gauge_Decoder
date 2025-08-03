@@ -1,6 +1,6 @@
 # TFA Drop Rain Gauge Decoder (30.3233.01)
  - This is a TFA Drop Rain Gauge 30.3233.01 decoder script for Arduino
- - The TFA 30.3233.01 is a 433MHz wireless rain gauge with 0.254mm resolution
+ - The 30.3233.01 is a 433MHz wireless rain gauge with 0.254mm resolution
  - Decodes 64-bit PWM messages with CRC-8 validation
  - Works with ESP32 and similar boards
  - Uses RX470-4 receiver module (less than $2 on Ali)
@@ -16,7 +16,6 @@
  - PWM pulse decoding with timing tolerance
  - Non-blocking operation
  - IRQ overload protection
- - Production and debug output modes
  - So that even beginners (like me) can understand 433MHz decoding
 
 ## How does it work
