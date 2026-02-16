@@ -1,0 +1,508 @@
+#include <Arduino.h>
+#include <CC1101_ESP_Arduino.h>
+
+//ESP32 PINs
+const int SPI_SCK = 18;   //board or mcu specific
+const int SPI_MISO = 19;  //board or mcu specific
+const int SPI_MOSI = 23;  //board or mcu specific
+const int SPI_CS = 5;     //select any pin
+
+const int GDO0_PIN = 27;  //select any pin, this is the RX-PIN
+
+int8_t lastSignalRssi = 0;
+
+CC1101 cc1101(SPI_SCK, SPI_MISO, SPI_MOSI, SPI_CS, GDO0_PIN);
+
+
+// Timing constants
+#define PULSE_SHORT 250
+#define PULSE_LONG 500
+#define TOLERANCE 150
+#define SYNC_PULSE_MIN 1500
+#define MAX_CHANGES 150
+
+// Protocol constants
+#define MESSAGE_BITS 64
+#define MESSAGE_BYTES 8
+#define MIN_BITS 64
+
+// Rain gauge constants
+#define RAIN_COUNTER_OFFSET 65526
+#define RAIN_TIP_TO_MM 0.254f
+#define EXPECTED_PREFIX 0x3
+#define EXPECTED_CONSTANT 0xAA
+
+// CRC constants
+#define CRC_GENERATOR 0x31
+#define CRC_INITIAL_KEY 0xF4
+
+// Bit masks
+#define BATTERY_LOW_MASK 0x80
+#define DEVICE_RESET_MASK 0x40
+#define TX_COUNTER_MASK 0x0F
+
+// Global variables (for interrupt)
+volatile uint16_t timings[MAX_CHANGES];
+volatile int timingIndex = 0;
+volatile unsigned long lastTime = 0;
+volatile bool recording = false;
+volatile unsigned long recordingStartTime = 0;
+
+// IRQ counter
+volatile unsigned long irqCounter = 0;
+unsigned long lastIrqCount = 0;
+unsigned long lastIrqTime = 0;
+unsigned long irqPerSecond = 0;
+unsigned long irqPause = 0;
+
+// Statistics counters
+unsigned long totalReceived = 0;         // Total first messages received
+unsigned long successfulDuplicates = 0;  // Successful duplicates
+unsigned long timeoutDuplicates = 0;     // Timeout without duplicate
+unsigned long differentMessages = 0;     // Different messages
+
+// Data processing state
+bool dataReady = false;
+uint8_t validData[MESSAGE_BYTES];
+
+// Duplicate message validation
+struct PendingMessage {
+  uint8_t data[MESSAGE_BYTES];
+  unsigned long timestamp;
+};
+
+PendingMessage pendingMessage;
+bool hasPendingMessage = false;
+
+// Validate duplicate messages within 200ms
+bool validateDuplicate(const uint8_t* data) {
+  unsigned long currentTime = millis();
+
+  if (!hasPendingMessage) {
+    // Store first message, wait for duplicate
+    memcpy(pendingMessage.data, data, MESSAGE_BYTES);
+    pendingMessage.timestamp = currentTime;
+    hasPendingMessage = true;
+
+    totalReceived++;
+
+    Serial.println("[MSGS]: First message received, waiting 200ms for duplicate...");
+    return false;
+  }
+
+  unsigned long timeDiff = currentTime - pendingMessage.timestamp;
+
+  if (memcmp(pendingMessage.data, data, MESSAGE_BYTES) == 0) {
+    successfulDuplicates++;
+
+    Serial.printf("[MSGS]: Duplicate received after %lums - message valid!\n", timeDiff);
+
+    hasPendingMessage = false;
+    return true;
+  }
+
+  // Different message within 200ms - discard both and use new as first
+  differentMessages++;
+
+  Serial.printf("[MSGS]: Different message within %lums - discarding both, using new as first\n", timeDiff);
+
+  memcpy(pendingMessage.data, data, MESSAGE_BYTES);
+  pendingMessage.timestamp = currentTime;
+
+  Serial.println("[MSGS]: New first message received, waiting 200ms for duplicate...");
+  return false;
+}
+
+
+
+// LFSR CRC-8 checksum function with byte reflection
+uint8_t lfsr_digest8_reflect(const uint8_t message[], int bytes, uint8_t gen, uint8_t key) {
+  uint8_t sum = 0;
+
+  // Process bytes from back to front (reflected)
+  for (int k = bytes - 1; k >= 0; --k) {
+    uint8_t data = message[k];
+
+    // Process bits from LSB to MSB (reflected)
+    for (int i = 0; i < 8; ++i) {
+      // XOR key in sum when data bit is set
+      if ((data >> i) & 1) {
+        sum ^= key;
+      }
+
+      // Key shift (optimized)
+      if (key & 0x80) {
+        key = ((key << 1) & 0xFF) ^ gen;
+      } else {
+        key = (key << 1) & 0xFF;
+      }
+    }
+  }
+
+  return sum;
+}
+
+// Quick pre-validation
+bool quickValidation(const uint8_t* data) {
+  // Check prefix first
+  uint8_t prefix = (data[0] >> 4) & 0x0F;
+  if (prefix != EXPECTED_PREFIX) {
+    return false;
+  }
+
+  // Then check constant
+  if (data[5] != EXPECTED_CONSTANT) {
+    return false;
+  }
+
+  return true;
+}
+
+// Full CRC validation (only after passing quick check)
+bool validateCRC(const uint8_t* data) {
+  uint8_t computed_crc = lfsr_digest8_reflect(data, MESSAGE_BYTES - 1, CRC_GENERATOR, CRC_INITIAL_KEY);
+  uint8_t expected_crc = data[MESSAGE_BYTES - 1];
+
+  if (computed_crc == expected_crc) {
+
+    return true;
+  } else {
+    Serial.printf("[FAIL]: CRC computed=0x%02X, expected=0x%02X\n", computed_crc, expected_crc);
+    return false;
+  }
+}
+
+// Optimized validation with multi-stage check
+bool validateMessage(const uint8_t* data) {
+
+  // Stage 1: Duplicate validation
+  if (!validateDuplicate(data)) {
+    return false;
+  }
+
+  // Stage 2: Quick validation
+  if (!quickValidation(data)) {
+    return false;
+  }
+
+  // Stage 3: CRC validation
+  return validateCRC(data);
+}
+
+// Hardware Interrupt
+void IRAM_ATTR handleRFInterrupt() {
+
+  irqCounter = irqCounter + 1;
+
+  if (millis() < irqPause) {
+    return;
+  }
+
+  unsigned long currentTime = micros();
+
+  if (lastTime == 0) {
+    lastTime = currentTime;
+    return;
+  }
+
+  unsigned long duration = currentTime - lastTime;
+  lastTime = currentTime;
+
+  if (duration < 100 || duration > 10000) {
+    return;
+  }
+
+  if (duration > SYNC_PULSE_MIN) {
+    if (timingIndex >= MIN_BITS) {
+      recording = false;
+    } else {
+      timingIndex = 0;
+      recording = true;
+      recordingStartTime = millis();
+    }
+    return;
+  }
+
+  if (recording && timingIndex < MAX_CHANGES) {
+    timings[timingIndex] = duration;
+    timingIndex = timingIndex + 1;
+  }
+
+  if (timingIndex >= MAX_CHANGES) {
+    recording = false;
+  }
+}
+
+// Main processing function
+bool searchDecodeAndValidateData() {
+  // Check if we have enough data for analysis
+  if (recording || timingIndex < MIN_BITS) {
+    return false;
+  }
+
+  uint8_t data[MESSAGE_BYTES] = { 0 };
+  int bitIndex = 0;
+
+  // Copy timings to avoid interference
+  uint16_t localTimings[MAX_CHANGES];
+  int localTimingIndex;
+
+  noInterrupts();
+  memcpy(localTimings, (const void*)timings, sizeof(localTimings));
+  localTimingIndex = timingIndex;
+  interrupts();
+
+  // Skip sync signal
+  int startIndex = 0;
+  for (int i = 0; i < 6 && i < localTimingIndex; i++) {
+    if (localTimings[i] > 600) {
+      startIndex = i + 1;
+    }
+  }
+
+  // PWM decoding: Pulses come in pairs (pulse + gap)
+  for (int i = startIndex; i < localTimingIndex - 1 && bitIndex < MESSAGE_BITS; i += 2) {
+    unsigned long pulse = localTimings[i];
+    unsigned long gap = localTimings[i + 1];
+
+    bool bit = false;
+
+    // PWM detection: 0 = short pulse + long gap, 1 = long pulse + short gap
+    if (abs((int)pulse - PULSE_SHORT) < TOLERANCE && abs((int)gap - PULSE_LONG) < TOLERANCE) {
+      bit = false;
+    } else if (abs((int)pulse - PULSE_LONG) < TOLERANCE && abs((int)gap - PULSE_SHORT) < TOLERANCE) {
+      bit = true;
+    }
+
+    // Store bit (MSB first)
+    int byteIndex = bitIndex / 8;
+    int bitPos = 7 - (bitIndex % 8);
+
+    if (bit) {
+      data[byteIndex] |= (1 << bitPos);
+    }
+
+    bitIndex++;
+  }
+
+  // Only accept exactly 64 bits
+  if (bitIndex != MESSAGE_BITS) {
+    // Reset for next attempt
+    noInterrupts();
+    timingIndex = 0;
+    recording = false;
+    lastTime = 0;
+    interrupts();
+    return false;
+  }
+
+  // Multi-stage validation
+  bool isValid = validateMessage(data);
+
+  if (isValid) {
+    // Valid data found - save for output
+    memcpy(validData, data, MESSAGE_BYTES);
+    return true;
+  } else {
+    // Invalid data - reset for next attempt
+    noInterrupts();
+    timingIndex = 0;
+    recording = false;
+    lastTime = 0;
+    interrupts();
+    return false;
+  }
+}
+
+// Output data and reset for new search
+void outputDataAndReset() {
+
+  // Pause IRQ to prevent echoes
+  irqPause = millis() + 1000;
+
+  printData(validData, MESSAGE_BITS);
+
+  // Reset for new data search
+  noInterrupts();
+  timingIndex = 0;
+  recording = false;
+  lastTime = 0;
+  interrupts();
+
+  dataReady = false;
+}
+
+// Calculate real tips from rain counter
+int calculateRealTips(uint16_t rainCounter) {
+  int realTips = rainCounter - RAIN_COUNTER_OFFSET;
+  if (realTips < 0) {
+    // Consider overflow (after 65535 comes 0)
+    realTips = rainCounter + (65536 - RAIN_COUNTER_OFFSET);
+  }
+  return realTips;
+}
+
+// Output function
+void printData(uint8_t* data, int bitCount) {
+  Serial.printf("\n=== Rain Gauge Data ===\n");
+  Serial.printf("Signal RSSI: %d dBm\n", lastSignalRssi);
+  Serial.printf("Received Bits: %d\n", bitCount);
+
+  // Raw data as HEX
+  Serial.print("Raw: ");
+  for (int i = 0; i < MESSAGE_BYTES; i++) {
+    Serial.printf("%02X", data[i]);
+  }
+  Serial.println();
+
+  // Bitwise output with formatting
+  Serial.print("Bits: ");
+  for (int i = 0; i < MESSAGE_BITS; i++) {
+    int byteIndex = i / 8;
+    int bitPos = 7 - (i % 8);
+    bool bit = (data[byteIndex] & (1 << bitPos)) != 0;
+    Serial.print(bit ? "1" : "0");
+
+    if ((i + 1) % 8 == 0 && i < 63) {
+      Serial.print(" ");
+    }
+  }
+  Serial.println();
+  Serial.println("      CCCCIIII IIIIIIII IIIIIIII BCUUXXXX RRRRRRRR CCCCCCCC SSSSSSSS MMMMMMMM");
+
+  uint32_t deviceId = ((data[0] & 0x0F) << 16) | (data[1] << 8) | data[2];
+  Serial.printf("Device ID: 0x%05lX (%lu)\n", (unsigned long)deviceId, (unsigned long)deviceId);
+
+  bool deviceReset = (data[3] & DEVICE_RESET_MASK) != 0;
+  Serial.printf("Reset: %s\n", deviceReset ? "YES" : "NO");
+
+  uint8_t txCounter = data[3] & TX_COUNTER_MASK;
+  Serial.printf("TX Counter: 0x%X (%d)\n", txCounter, txCounter);
+
+  bool batteryLow = (data[3] & BATTERY_LOW_MASK) != 0;
+  Serial.printf("Battery: %s\n", batteryLow ? "LOW" : "OK");
+
+  // Rain counter calculation
+  uint16_t rainCounter = (data[6] << 8) + data[4];  // MSB + LSB
+  int realTips = calculateRealTips(rainCounter);
+  float rainMM = realTips * RAIN_TIP_TO_MM;
+
+  Serial.printf("Rain Counter 16-Bit: %d\n", rainCounter);
+  Serial.printf("Real Tips: %d\n", realTips);
+  Serial.printf("Precipitation: %.3f mm\n", rainMM);
+
+  // CRC verification
+  uint8_t computed_crc = lfsr_digest8_reflect(data, MESSAGE_BYTES - 1, CRC_GENERATOR, CRC_INITIAL_KEY);
+  Serial.printf("CRC: computed=0x%02X, received=0x%02X (%s)\n",
+                computed_crc, data[7], (computed_crc == data[7]) ? "OK" : "FAILED");
+
+  Serial.printf("IRQ/s: %lu\n", irqPerSecond);
+
+  // Reception statistics
+  Serial.println("\n--- Reception Statistics ---");
+  Serial.printf("Total Received: %lu\n", totalReceived);
+  Serial.printf("Successful Duplicates: %lu (%.1f%%)\n",
+                successfulDuplicates,
+                totalReceived > 0 ? (successfulDuplicates * 100.0 / totalReceived) : 0);
+  Serial.printf("Duplicate Timeouts: %lu (%.1f%%)\n",
+                timeoutDuplicates,
+                totalReceived > 0 ? (timeoutDuplicates * 100.0 / totalReceived) : 0);
+  Serial.printf("Different Messages: %lu\n", differentMessages);
+
+  Serial.println();
+}
+
+
+
+
+
+// IRQ COUNTER FUNCTION
+void updateIrqCounter() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastIrqTime >= 1000) {
+    noInterrupts();
+    unsigned long currentIrqCount = irqCounter;
+    interrupts();
+
+    irqPerSecond = currentIrqCount - lastIrqCount;
+    lastIrqCount = currentIrqCount;
+    lastIrqTime = currentTime;
+    if (!recording) {
+      int8_t rssi = cc1101.getRSSI();
+      Serial.printf("[IRQ] %lu IRQ/s | RSSI: %d dBm\n", irqPerSecond, rssi);
+     }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+
+  Serial.println("=== Rain Gauge Decoder with CRC Validation ===");
+  Serial.println("Timing Parameters:");
+  Serial.printf("- Short Pulse: %d us (+/-%d)\n", PULSE_SHORT, TOLERANCE);
+  Serial.printf("- Long Pulse: %d us (+/-%d)\n", PULSE_LONG, TOLERANCE);
+  Serial.printf("- Sync Minimum: %d us\n", SYNC_PULSE_MIN);
+  Serial.println("PWM Decoding: Standard logic (short/long -> 0/1)");
+  Serial.println("Validation: Multi-stage (Prefix -> Constant -> CRC)");
+  Serial.printf("CRC Parameters: Generator=0x%02X, Initial=0x%02X\n", CRC_GENERATOR, CRC_INITIAL_KEY);
+  Serial.println("Accepts only exact 64-bit messages with valid CRC!");
+
+
+  cc1101.init();
+  Serial.printf("CC1101: 0x%02x, version: 0x%02x\n", cc1101.getPartnum(), cc1101.getVersion());
+  cc1101.setMHZ(433.92);
+  cc1101.setDataRate(2000);
+  cc1101.setRxBW(RX_BW_203_KHZ);
+  cc1101.setModulation(ASK_OOK);
+  cc1101.setRx();
+
+
+
+  // Setup RF interrupt
+  pinMode(GDO0_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(GDO0_PIN), handleRFInterrupt, CHANGE);
+
+  Serial.println("Setup complete. Waiting for rain gauge signals...");
+}
+
+void loop() {
+  // Update IRQ counter
+  updateIrqCounter();
+
+  // Check recording timeout
+  if (recording) {
+    unsigned long recordingDuration = millis() - recordingStartTime;
+    if (recordingDuration > 100) {  // 100ms elapsed since START
+      noInterrupts();
+      recording = false;
+      timingIndex = 0;
+      lastTime = 0;
+      interrupts();
+      Serial.println("[FAIL]: Recording timeout");
+    }
+  }
+  // Check duplicate timeout
+  if (hasPendingMessage) {
+    unsigned long waitTime = millis() - pendingMessage.timestamp;
+    if (waitTime > 200) {
+      timeoutDuplicates++;
+
+      Serial.printf("[FAIL]: Duplicate timeout after %lums - discarding message\n", waitTime);
+      hasPendingMessage = false;
+    }
+  }
+  // Continuous search for usable data
+  if (!dataReady && !recording && timingIndex >= MIN_BITS) {
+    lastSignalRssi = cc1101.getRSSI();  // Measure RSSI now
+    Serial.printf("[SIGNAL] RSSI: %d dBm\n", lastSignalRssi);
+    dataReady = searchDecodeAndValidateData();
+  }
+  // If valid data found, output and reset
+  if (dataReady) {
+    outputDataAndReset();
+  }
+
+  yield();
+}
